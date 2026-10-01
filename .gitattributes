@@ -1,0 +1,16 @@
+# 统一换行符：仓库内文本文件一律以 LF 存储与检出。
+# 若在 Windows 上检出成 CRLF，bash 脚本会带着 \r 执行并直接报错，
+# workflow 与 python 文件也可能出现难以定位的问题，因此这里强制 LF。
+* text=auto eol=lf
+
+# 二进制文件不做任何换行转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.exe binary
+*.dll binary

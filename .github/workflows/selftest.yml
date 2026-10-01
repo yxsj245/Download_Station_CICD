@@ -1,0 +1,82 @@
+name: 自测
+
+# 本仓库的自我保护：改动上传脚本或 workflow 时先在这里验证，
+# 避免把问题带到所有调用方项目。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  script-selftest:
+    name: 上传脚本端到端自测
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v7
+
+      - name: bash 语法检查
+        run: |
+          set -euo pipefail
+          bash -n scripts/relay-upload.sh
+          bash -n tests/run-selftest.sh
+          echo '语法检查通过。'
+
+      - name: YAML 配置自检
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check pyyaml
+          python3 tests/check-yaml.py
+
+      - name: 白名单自检（宿主仓库必须被放行）
+        # 本仓库自己就是第一个调用方：如果白名单没包含宿主组织或宿主仓库全名，
+        # 后面所有自测都会以退出码 9 失败，这里提前把原因说清楚。
+        run: |
+          set -euo pipefail
+          RELAY_GUARD_ONLY=1 bash scripts/relay-upload.sh
+
+      - name: 安装 jq（覆盖 jq 解析分支）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq
+          jq --version
+
+      - name: 端到端自测（jq 分支）
+        run: bash tests/run-selftest.sh
+
+      - name: 端到端自测（无 jq 的 python 回退分支）
+        run: |
+          set -euo pipefail
+          # 临时屏蔽 jq，验证精简环境与 Windows 上实际会走到的回退分支
+          sudo mv /usr/bin/jq /usr/bin/jq.disabled
+          bash tests/run-selftest.sh
+          sudo mv /usr/bin/jq.disabled /usr/bin/jq
+
+      - name: 参数校验产物（dry-run 冒烟）
+        run: |
+          set -euo pipefail
+          RELAY_BASE=https://relay.invalid \
+          RELAY_ADMIN_KEY=dry-run-admin-key \
+          RELAY_UPLOAD_KEY=dry-run-upload-key \
+          RELAY_FILE=docs/README.md \
+          RELAY_LOGICAL_PATH=selftest/dry-run/README.md \
+          RELAY_DRY_RUN=1 \
+          bash scripts/relay-upload.sh
+
+  reusable-dry-run:
+    name: reusable workflow 链路验证
+    # 内部通过 $/ 自仓库语法引用本仓库 action，不依赖 v1 标签，
+    # 因此每次推送与 PR 都能验证这条链路。
+    uses: ./.github/workflows/relay-upload.yml
+    with:
+      relay-base: https://relay.invalid
+      file: docs/README.md
+      logical-path: selftest/reusable-workflow/README.md
+      dry-run: 'true'
+    secrets:
+      RELAY_ADMIN_KEY: dry-run-admin-key
+      RELAY_UPLOAD_KEY: dry-run-upload-key

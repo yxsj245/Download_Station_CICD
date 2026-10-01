@@ -1,0 +1,124 @@
+name: 'Relay Upload（上传中继）'
+description: '把构建产物按统一逻辑路径上传到上传中继，并等待全部目标渠道进入终态'
+author: 'yxsj245'
+
+# 统一上传入口（就地调用形态）：
+# 调用方在自己的 job 里构建完产物后直接用本 action，不需要 artifact 往返。
+# 用法：
+#   - uses: yxsj245/Download_Station_CICD/relay-upload@v1
+#     with:
+#       relay-base: ${{ vars.RELAY_BASE }}
+#       admin-key: ${{ secrets.RELAY_ADMIN_KEY }}
+#       upload-key: ${{ secrets.RELAY_UPLOAD_KEY }}
+#       file: dist/app.zip
+#       logical-path: releases/${{ github.event.repository.name }}/${{ github.ref_name }}/app.zip
+#
+# 注意：凭证一律由调用方提供（本仓库不保存任何中继密钥）。reusable workflow
+# 形态通过 secrets 传入，就地调用形态则在下面的 with 里传入。
+
+inputs:
+  guard-only:
+    description: '只校验调用方是否在允许清单内，不读取凭证、不发起请求（供 workflow 的权限校验 job 使用）'
+    required: false
+    default: 'false'
+  relay-base:
+    description: '中继对外地址，例如 https://relay.example.com（不含尾斜杠）；必填性由脚本校验'
+    required: false
+  admin-key:
+    description: '管理员 Key（SR_ADMIN_API_KEY），用于登记统一路径'
+    required: false
+  upload-key:
+    description: '上传 Key（SR_UPLOAD_API_KEY），用于解析 file_id、上传正文与查询任务'
+    required: false
+  file:
+    description: '待上传的本地文件路径，支持相对工作目录或绝对路径；必填性由脚本校验'
+    required: false
+  logical-path:
+    description: '统一逻辑路径，例如 releases/app/v1.0.0/app.zip；必填性由脚本校验'
+    required: false
+  idempotency-key:
+    description: '幂等键，留空时自动按「运行 ID + 尝试次数 + job + 统一路径」生成'
+    required: false
+    default: ''
+  content-type:
+    description: '上传正文的 Content-Type'
+    required: false
+    default: 'application/octet-stream'
+  poll-interval:
+    description: '查询任务终态的间隔秒数'
+    required: false
+    default: '3'
+  poll-timeout:
+    description: '等待任务终态的最长秒数，0 表示一直等待'
+    required: false
+    default: '1800'
+  connect-timeout:
+    description: '连接中继的超时秒数'
+    required: false
+    default: '30'
+  upload-timeout:
+    description: '上传正文的最长秒数，0 表示不限制'
+    required: false
+    default: '0'
+  dry-run:
+    description: '仅校验参数与统一路径，不发起任何请求'
+    required: false
+    default: 'false'
+  debug:
+    description: '输出更详细的调试信息（密钥始终脱敏）'
+    required: false
+    default: 'false'
+
+outputs:
+  caller-repository:
+    description: '调用方仓库（由 GitHub 注入，用于审计）'
+    value: ${{ steps.upload.outputs.caller_repository }}
+  task-id:
+    description: '中继返回的任务 ID'
+    value: ${{ steps.upload.outputs.task_id }}
+  state:
+    description: '任务终态：succeeded / partial_failed / failed / cancelled / dry_run'
+    value: ${{ steps.upload.outputs.state }}
+  file-id:
+    description: '统一路径对应的 file_id'
+    value: ${{ steps.upload.outputs.file_id }}
+  sha256:
+    description: '上传正文的 SHA-256'
+    value: ${{ steps.upload.outputs.sha256 }}
+  size-bytes:
+    description: '上传正文的字节数'
+    value: ${{ steps.upload.outputs.size_bytes }}
+  idempotency-key:
+    description: '本次实际使用的幂等键'
+    value: ${{ steps.upload.outputs.idempotency_key }}
+
+runs:
+  using: composite
+  steps:
+    - name: 执行统一上传脚本
+      id: upload
+      shell: bash
+      env:
+        RELAY_GUARD_ONLY: ${{ inputs.guard-only }}
+        RELAY_BASE: ${{ inputs.relay-base }}
+        RELAY_ADMIN_KEY: ${{ inputs.admin-key }}
+        RELAY_UPLOAD_KEY: ${{ inputs.upload-key }}
+        RELAY_FILE: ${{ inputs.file }}
+        RELAY_LOGICAL_PATH: ${{ inputs.logical-path }}
+        RELAY_IDEMPOTENCY_KEY: ${{ inputs.idempotency-key }}
+        RELAY_CONTENT_TYPE: ${{ inputs.content-type }}
+        RELAY_POLL_INTERVAL: ${{ inputs.poll-interval }}
+        RELAY_POLL_TIMEOUT: ${{ inputs.poll-timeout }}
+        RELAY_CONNECT_TIMEOUT: ${{ inputs.connect-timeout }}
+        RELAY_UPLOAD_TIMEOUT: ${{ inputs.upload-timeout }}
+        RELAY_DRY_RUN: ${{ inputs.dry-run }}
+        RELAY_DEBUG: ${{ inputs.debug }}
+      run: |
+        set -euo pipefail
+        script="$GITHUB_ACTION_PATH/../scripts/relay-upload.sh"
+        if [ ! -f "$script" ]; then
+          echo "[错误] 未找到统一上传脚本：$script" >&2
+          echo "[错误] 请确认 action 引用路径指向本仓库根目录下的 relay-upload 目录。" >&2
+          exit 3
+        fi
+        bash "$script"

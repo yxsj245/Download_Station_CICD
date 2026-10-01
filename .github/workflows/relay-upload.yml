@@ -1,0 +1,220 @@
+name: Relay Upload（上传中继）
+
+# 统一上传入口（独立 job 形态）：
+# 其它项目只需要在自己的 workflow 里写几行，就能把构建产物交给上传中继分发。
+# 调用示例（调用方仓库）：
+#
+#   jobs:
+#     build:
+#       runs-on: ubuntu-latest
+#       steps:
+#         - uses: actions/checkout@v7
+#         - run: ./build.sh
+#         - uses: actions/upload-artifact@v7
+#           with:
+#             name: dist
+#             path: dist/
+#
+#     upload:
+#       needs: build
+#       uses: yxsj245/Download_Station_CICD/.github/workflows/relay-upload.yml@v1
+#       with:
+#         artifact-name: dist
+#         file: app.zip
+#         logical-path: releases/my-app/v1.2.3/app.zip
+#       secrets: inherit
+#
+# 凭证来源（重要）：
+#   由**调用方**通过 secrets 传入 RELAY_ADMIN_KEY / RELAY_UPLOAD_KEY，
+#   推荐在调用方组织里配成 Organization secrets，一处维护、全组织复用。
+#   本仓库**不保存任何中继密钥**：本仓库是 public 仓库，任何账号都能引用本
+#   workflow（甚至引用历史提交）；一旦密钥放在这里，外部调用者就能借用我们的
+#   凭证往中继上传任意路径。密钥始终来自调用方自己的 secret，别人引用本
+#   workflow 时只能用自己的凭证，什么也拿不到。
+#
+# 调用权限（代码层白名单）：
+#   只有 scripts/relay-upload.sh 顶部 ALLOWED_CALLER_OWNERS /
+#   ALLOWED_CALLER_REPOSITORIES 列出的仓库能通过校验，用于拦截未授权仓库（防误用）。
+#   public 仓库的历史提交同样可被引用，白名单挡不住恶意者——但这不影响安全：
+#   恶意者手里没有我们的凭证，能做的最多是用他们自己的密钥上传他们自己的文件。
+#   详见 docs/usage.md 的「调用权限」。
+
+on:
+  workflow_call:
+    inputs:
+      relay-base:
+        description: '中继对外地址（不含尾斜杠）；留空时读调用方仓库的变量 RELAY_BASE'
+        type: string
+        required: false
+        default: ''
+      artifact-name:
+        description: '构建产物 artifact 名称；填写后会先下载到工作目录再上传'
+        type: string
+        required: false
+        default: ''
+      artifact-path:
+        description: '构建产物下载目录，相对工作目录'
+        type: string
+        required: false
+        default: '.'
+      file:
+        description: '待上传文件路径，相对工作目录或绝对路径（配合 artifact-name 使用）'
+        type: string
+        required: true
+      logical-path:
+        description: '统一逻辑路径，例如 releases/app/v1.0.0/app.zip'
+        type: string
+        required: true
+      idempotency-key:
+        description: '幂等键，留空时自动按「运行 ID + 尝试次数 + job + 统一路径」生成（重跑会重新上传覆盖）'
+        type: string
+        required: false
+        default: ''
+      poll-interval:
+        description: '查询任务终态的间隔秒数'
+        type: string
+        required: false
+        default: '3'
+      poll-timeout:
+        description: '等待任务终态的最长秒数，0 表示一直等待'
+        type: string
+        required: false
+        default: '1800'
+      dry-run:
+        description: '仅校验参数与统一路径，不发起任何请求（用于接入联调）'
+        type: string
+        required: false
+        default: 'false'
+      debug:
+        description: '输出更详细的调试信息（密钥始终脱敏）'
+        type: string
+        required: false
+        default: 'false'
+      runs-on:
+        description: '运行器标签；中继只在局域网时改成 self-hosted 标签'
+        type: string
+        required: false
+        default: ubuntu-latest
+
+    secrets:
+      RELAY_ADMIN_KEY:
+        description: '管理员 Key（登记统一路径），由调用方传入；建议配成组织级 secret'
+        required: true
+      RELAY_UPLOAD_KEY:
+        description: '上传 Key（上传正文与查询任务），由调用方传入；建议配成组织级 secret'
+        required: true
+
+    outputs:
+      caller-repository:
+        description: '调用方仓库（用于审计）'
+        value: ${{ jobs.guard.outputs.caller }}
+      task-id:
+        description: '中继返回的任务 ID'
+        value: ${{ jobs.upload.outputs.task-id }}
+      state:
+        description: '任务终态：succeeded / partial_failed / failed / cancelled / dry_run'
+        value: ${{ jobs.upload.outputs.state }}
+      file-id:
+        description: '统一路径对应的 file_id'
+        value: ${{ jobs.upload.outputs.file-id }}
+      sha256:
+        description: '上传正文的 SHA-256'
+        value: ${{ jobs.upload.outputs.sha256 }}
+      size-bytes:
+        description: '上传正文的字节数'
+        value: ${{ jobs.upload.outputs.size-bytes }}
+      idempotency-key:
+        description: '本次实际使用的幂等键'
+        value: ${{ jobs.upload.outputs.idempotency-key }}
+
+jobs:
+  guard:
+    name: 调用方权限校验
+    # 只有白名单内的仓库才能继续；校验不通过时上传 job 根本不会启动。
+    # 白名单写在 scripts/relay-upload.sh 顶部，不接受任何 input / secret / vars。
+    #
+    # runs-on 刻意固定为 GitHub 托管 runner，不跟随 inputs.runs-on：
+    # 一旦调用方能把这步放到自己控制的 runner 上，他们就能篡改脚本或伪造
+    # 环境变量，代码层校验会彻底失效。上传 job 仍可用自建 runner（内网场景）。
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      caller: ${{ steps.check.outputs.caller-repository }}
+    steps:
+      - name: 校验调用方是否在允许清单内
+        id: check
+        uses: $/relay-upload
+        with:
+          guard-only: 'true'
+
+  upload:
+    name: 上传到上传中继
+    needs: guard
+    runs-on: ${{ inputs.runs-on }}
+    # 刻意不挂 environment：本仓库不保存中继密钥，environment 在这里已无作用，
+    # 反而有隐患——environment 里的同名 secret 会覆盖调用方传入的 secret，
+    # 万一将来有人往里配了密钥，就会静默用维护者的凭证替别人上传。
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      task-id: ${{ steps.upload.outputs.task-id }}
+      state: ${{ steps.upload.outputs.state }}
+      file-id: ${{ steps.upload.outputs.file-id }}
+      sha256: ${{ steps.upload.outputs.sha256 }}
+      size-bytes: ${{ steps.upload.outputs.size-bytes }}
+      idempotency-key: ${{ steps.upload.outputs.idempotency-key }}
+
+    steps:
+      - name: 凭证来源自检
+        # 首次接入时用来确认凭证到底取到了没有；只报告有无，绝不打印密钥本身。
+        shell: bash
+        env:
+          ADMIN_KEY: ${{ secrets.RELAY_ADMIN_KEY }}
+          UPLOAD_KEY: ${{ secrets.RELAY_UPLOAD_KEY }}
+          RELAY_BASE_VALUE: ${{ inputs.relay-base || vars.RELAY_BASE }}
+        run: |
+          set -euo pipefail
+          echo "[信息] 调用方仓库：$GITHUB_REPOSITORY（已通过权限校验）"
+          if [ -n "$RELAY_BASE_VALUE" ]; then
+            echo "[信息] 已取到中继地址。"
+          else
+            echo "::error::未取到中继地址：请在调用时传 relay-base，或在调用方仓库配置变量 RELAY_BASE。"
+          fi
+          if [ -n "$ADMIN_KEY" ]; then
+            echo "[信息] 已取到管理员 Key。"
+          else
+            echo "::error::未取到管理员 Key：请在调用方仓库（建议组织级）配置 secret RELAY_ADMIN_KEY，并用 secrets: inherit 或显式传入。本仓库不保存中继密钥。"
+          fi
+          if [ -n "$UPLOAD_KEY" ]; then
+            echo "[信息] 已取到上传 Key。"
+          else
+            echo "::error::未取到上传 Key：请在调用方仓库（建议组织级）配置 secret RELAY_UPLOAD_KEY，并用 secrets: inherit 或显式传入。本仓库不保存中继密钥。"
+          fi
+
+      - name: 下载构建产物
+        if: ${{ inputs.artifact-name != '' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.artifact-path }}
+
+      - name: 上传到中继
+        id: upload
+        # 使用 GitHub 的自仓库语法：解析到「本 workflow 正在运行的那个提交」，
+        # 不需要 checkout，仓库改名或迁移时也不用改这一行；
+        # 调用方把 ref 固定到具体提交时，内部引用也不会漂移到标签新指向。
+        # 需要 runner >= 2.336.0（GitHub 托管 runner 均满足）。
+        uses: $/relay-upload
+        with:
+          relay-base: ${{ inputs.relay-base || vars.RELAY_BASE }}
+          admin-key: ${{ secrets.RELAY_ADMIN_KEY }}
+          upload-key: ${{ secrets.RELAY_UPLOAD_KEY }}
+          file: ${{ inputs.file }}
+          logical-path: ${{ inputs.logical-path }}
+          idempotency-key: ${{ inputs.idempotency-key }}
+          poll-interval: ${{ inputs.poll-interval }}
+          poll-timeout: ${{ inputs.poll-timeout }}
+          dry-run: ${{ inputs.dry-run }}
+          debug: ${{ inputs.debug }}

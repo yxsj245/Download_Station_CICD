@@ -1,0 +1,12 @@
+# 本地运行与打包产生的临时文件
+*.log
+*.tmp
+.tmp/
+temp/
+tmp/
+
+# 各编辑器的本地配置
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
